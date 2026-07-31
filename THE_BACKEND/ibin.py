@@ -1,3 +1,4 @@
+import os
 import time
 import math
 import random
@@ -8,10 +9,7 @@ from typing import Dict, List, Any, Optional, Iterable
 from collections import Counter
 from sklearn.ensemble import RandomForestRegressor
 
-# --- NEW: FastAPI Imports ---
-from fastapi import FastAPI
-from pydantic import BaseModel
-import uvicorn
+from supabase_config import create_supabase_client, get_supabase_credentials
 
 # =====================================================================
 # 1. DATA PROVIDER INTERFACE
@@ -139,32 +137,176 @@ class SupabaseDataProvider(BaseDataProvider):
     def __init__(self, supabase_url: str, supabase_key: str):
         from supabase import create_client
         self.supabase = create_client(supabase_url, supabase_key)
+        self.table_aliases = {
+            'cinemas': ['cinemas', 'theaters'],
+            'showtimes': ['showtimes'],
+            'screens': ['screens'],
+            'bookings': ['bookings'],
+            'screen_formats': ['screen_formats'],
+            'cinema_features': ['cinema_features', 'accessibility', 'theater_accessibility'],
+            'format_dictionary': ['format_dictionary'],
+            'feedback': ['training_feedback', 'feedback', 'recommendation_feedback'],
+        }
+        self.field_aliases = {
+            'cinema_id': ['cinema_id', 'theater_id', 'id'],
+            'screen_id': ['screen_id', 'id'],
+            'showtime_id': ['showtime_id', 'id'],
+            'format_name': ['format_name', 'name', 'format'],
+            'base_tier': ['base_tier', 'tier'],
+            'has_motion': ['has_motion_seats', 'has_motion', 'motion'],
+            'accessibility': ['supports_disabled_hosting', 'step_free_access', 'accessible', 'has_step_free_access', 'is_accessible'],
+            'name': ['name', 'cinema_name', 'title'],
+            'movie_id': ['movie_id', 'film_id', 'movie'],
+            'created_at': ['created_at', 'timestamp', 'created'],
+        }
+
+    def _infer_screen_formats(self, screen_row: Dict[str, Any]) -> List[str]:
+        formats: List[str] = []
+        screen_type = str(self._get_field(screen_row, 'screen_type', 'type', 'screen_type_name') or self._get_field(screen_row, 'name', 'screen_name') or '').strip().upper()
+        aspect_ratio = str(self._get_field(screen_row, 'aspect_ratio', 'ratio') or '').strip()
+        screen_name = str(self._get_field(screen_row, 'name', 'screen_name') or '').strip().upper()
+        combined = f"{screen_type} {screen_name} {aspect_ratio}".upper()
+
+        if 'IMAX' in combined or 'LASER' in combined:
+            formats.append('IMAX_LASER')
+        if '4DX' in combined or 'MOTION' in combined:
+            formats.append('4DX')
+        if 'DOLBY' in combined or 'ATMOS' in combined:
+            formats.append('DOLBY_CINEMA')
+        if 'PLX' in combined or 'PXL' in combined:
+            formats.append('PVR_PXL')
+        if '2D' in combined or 'STANDARD' in combined or aspect_ratio:
+            formats.append('STANDARD_2D')
+
+        if not formats:
+            formats.append('STANDARD_2D')
+        return list(dict.fromkeys(formats))
+
+    def _normalize_name(self, name: str) -> str:
+        return str(name).strip().lower().replace(' ', '_').replace('-', '_')
+
+    def _get_field(self, row: Optional[Dict[str, Any]], *names: str) -> Any:
+        if not isinstance(row, dict):
+            return None
+        for name in names:
+            normalized_name = self._normalize_name(name)
+            for key, value in row.items():
+                if self._normalize_name(key) == normalized_name:
+                    return value
+        return None
+
+    def _safe_select(self, table_name: str, filters: Optional[Dict[str, Any]] = None):
+        try:
+            query = self.supabase.table(table_name).select('*')
+            if filters:
+                for key, value in filters.items():
+                    query = query.eq(key, value)
+            return query.execute()
+        except Exception:
+            return type('EmptyResult', (), {'data': []})()
+
+    def _get_table_rows(self, logical_name: str, filters: Optional[Dict[str, Any]] = None):
+        for alias in self.table_aliases.get(logical_name, [logical_name]):
+            result = self._safe_select(alias, filters=filters)
+            if getattr(result, 'data', None):
+                return result.data
+        return []
+
+    def _find_matching_row(self, rows: Iterable[Dict[str, Any]], field_name: str, expected_value: Any) -> Optional[Dict[str, Any]]:
+        for row in rows:
+            if self._get_field(row, field_name) == expected_value:
+                return row
+        return None
 
     def get_format_knowledge_base(self) -> Dict[str, Dict[str, Any]]:
         try:
-            res = self.supabase.table('format_dictionary').select('*').execute()
+            rows = self._get_table_rows('format_dictionary')
             kb = {}
-            for row in res.data:
-                kb[row['format_name']] = {
-                    "tier": row['base_tier'],
-                    "has_motion": row['has_motion_seats']
-                }
-            return kb
+            for row in rows:
+                fmt = self._get_field(row, 'format_name', 'name')
+                if fmt:
+                    kb[fmt] = {
+                        "tier": int(self._get_field(row, *self.field_aliases['base_tier']) or 1),
+                        "has_motion": bool(self._get_field(row, *self.field_aliases['has_motion']) or False),
+                        "source": "supabase"
+                    }
+            if kb:
+                return kb
+            return {
+                "IMAX_LASER": {"tier": 5, "has_motion": False, "source": "fallback"},
+                "IMAX_2D": {"tier": 5, "has_motion": False, "source": "fallback"},
+                "DOLBY_CINEMA": {"tier": 5, "has_motion": False, "source": "fallback"},
+                "4DX": {"tier": 4, "has_motion": True, "source": "fallback"},
+                "PVR_PXL": {"tier": 4, "has_motion": False, "source": "fallback"},
+                "STANDARD_2D": {"tier": 1, "has_motion": False, "source": "fallback"},
+            }
         except Exception as e:
             print(f"⚠️ Supabase Error: Could not fetch knowledge base. ({e})")
             return {}
 
     def get_available_theaters(self) -> List[Dict[str, Any]]:
         try:
-            res = self.supabase.table('theaters').select('*, theater_screens(format_name)').execute()
+            cinemas_rows = self._get_table_rows('cinemas')
+            access_rows = self._get_table_rows('cinema_features')
+
+            features_by_cinema = {}
+            for row in access_rows:
+                cinema_id = self._get_field(row, *self.field_aliases['cinema_id'])
+                if cinema_id is not None:
+                    features_by_cinema[cinema_id] = row
+
+            showtimes_rows = self._get_table_rows('showtimes')
+            active_screen_ids = {
+                self._get_field(row, *self.field_aliases['screen_id'])
+                for row in showtimes_rows
+                if self._get_field(row, *self.field_aliases['screen_id']) is not None
+            }
+
             theaters = []
-            for row in res.data:
-                screens = [s['format_name'] for s in row.get('theater_screens', [])]
+            for row in cinemas_rows:
+                cinema_id = self._get_field(row, *self.field_aliases['cinema_id'])
+                if cinema_id is None:
+                    continue
+
+                screens_rows = self._get_table_rows('screens')
+                matching_screens = [
+                    screen for screen in screens_rows
+                    if self._get_field(screen, *self.field_aliases['cinema_id']) == cinema_id
+                ]
+
+                screens = []
+                for screen in matching_screens:
+                    screen_id = self._get_field(screen, *self.field_aliases['screen_id'])
+                    if screen_id is None or screen_id not in active_screen_ids:
+                        continue
+
+                    formats = []
+                    screen_format_rows = self._get_table_rows('screen_formats')
+                    for screen_format_row in screen_format_rows:
+                        if self._get_field(screen_format_row, *self.field_aliases['screen_id']) == screen_id:
+                            fmt = self._get_field(screen_format_row, *self.field_aliases['format_name'])
+                            if fmt:
+                                formats.append(fmt)
+
+                    if not formats:
+                        formats = self._infer_screen_formats(screen)
+                    if formats:
+                        screens.extend(formats)
+
+                if not screens:
+                    continue
+
+                feature_row = features_by_cinema.get(cinema_id, {})
+                has_access = False
+                for alias in self.field_aliases['accessibility']:
+                    if self._get_field(feature_row, alias) is True:
+                        has_access = True
+                        break
                 theaters.append({
-                    "id": row['id'],
-                    "name": row['name'],
-                    "distance_km": row['distance_km'],
-                    "has_step_free_access": row['has_step_free_access'],
+                    "id": str(cinema_id),
+                    "name": self._get_field(row, *self.field_aliases['name']) or f'Cinema {cinema_id}',
+                    "distance_km": 10.0,
+                    "has_step_free_access": bool(has_access),
                     "screens": screens
                 })
             return theaters
@@ -174,30 +316,65 @@ class SupabaseDataProvider(BaseDataProvider):
 
     def log_user_interaction(self, query_id: str, selected_theater_id: str, reward: float):
         try:
-            self.supabase.table('training_feedback').insert({
-                "query_id": query_id,
-                "selected_theater_id": selected_theater_id,
-                "relevance_reward": reward
-            }).execute()
-            print(f"  [Supabase DB Logged] Training point saved for Query {query_id}")
+            for table_name in self.table_aliases['feedback']:
+                try:
+                    self.supabase.table(table_name).insert({
+                        "query_id": query_id,
+                        "selected_theater_id": selected_theater_id,
+                        "relevance_reward": reward
+                    }).execute()
+                    print(f"  [Supabase DB Logged] Training point saved for Query {query_id}")
+                    return
+                except Exception:
+                    continue
         except Exception as e:
             print(f"⚠️ Supabase Error: Could not log interaction. ({e})")
 
     def get_booking_history(self) -> List[Dict[str, Any]]:
         try:
-            res = (
-                self.supabase.table('training_feedback')
-                .select('selected_theater_id, format_name, genre_bucket, query_id, created_at')
-                .execute()
-            )
+            bookings_rows = self._get_table_rows('bookings')
+            showtimes_rows = self._get_table_rows('showtimes')
+            screens_rows = self._get_table_rows('screens')
             history = []
-            for row in res.data:
+            for row in bookings_rows:
+                showtime_id = self._get_field(row, *self.field_aliases['showtime_id'])
+                if not showtime_id:
+                    continue
+
+                showtime = self._find_matching_row(showtimes_rows, 'showtime_id', showtime_id)
+                if showtime is None:
+                    showtime = self._find_matching_row(showtimes_rows, 'id', showtime_id)
+                if showtime is None:
+                    continue
+
+                screen_id = self._get_field(showtime, *self.field_aliases['screen_id'])
+                screen = self._find_matching_row(screens_rows, 'screen_id', screen_id) if screen_id is not None else None
+                if screen is None and screen_id is not None:
+                    screen = self._find_matching_row(screens_rows, 'id', screen_id)
+                if screen is None:
+                    continue
+
+                cinema_id = self._get_field(screen, *self.field_aliases['cinema_id'])
+                if cinema_id is None:
+                    continue
+
+                format_name = 'STANDARD_2D'
+                screen_format_rows = self._get_table_rows('screen_formats')
+                for screen_format_row in screen_format_rows:
+                    if self._get_field(screen_format_row, *self.field_aliases['screen_id']) == screen_id:
+                        fmt = self._get_field(screen_format_row, *self.field_aliases['format_name'])
+                        if fmt:
+                            format_name = fmt
+                            break
+                if format_name == 'STANDARD_2D':
+                    format_name = self._infer_screen_formats(screen)[0]
+
                 history.append({
-                    "theater_id": row.get('selected_theater_id'),
-                    "format_name": row.get('format_name'),
-                    "genre_bucket": row.get('genre_bucket', 'general'),
-                    "film_id": row.get('query_id'),
-                    "timestamp": row.get('created_at', time.time()),
+                    "theater_id": str(cinema_id),
+                    "format_name": format_name,
+                    "genre_bucket": 'general',
+                    "film_id": str(self._get_field(showtime, *self.field_aliases['movie_id']) or 'unknown'),
+                    "timestamp": self._get_field(row, *self.field_aliases['created_at']) or time.time(),
                 })
             return history
         except Exception as e:
@@ -388,36 +565,24 @@ class AuraMLEngine:
 
 
 # =====================================================================
-# 6. FASTAPI APPLICATION SETUP
+# 6. REST-STYLE RECOMMENDATION ENTRYPOINT
 # =====================================================================
 
-app = FastAPI(title="Aura ML API Engine", description="Recommends the best theaters using ML.")
-
-# Initialize Provider & Engine ONE time when server starts (prevents re-training on every API hit)
-USE_SUPABASE = False 
-provider = SupabaseDataProvider("", "") if USE_SUPABASE else MockDataProvider()
+# Initialize Provider & Engine once for local use.
+url, key = get_supabase_credentials()
+USE_SUPABASE = bool(url and key)
+if USE_SUPABASE:
+    provider = SupabaseDataProvider(url, key)
+else:
+    provider = MockDataProvider()
 ml_system = AuraMLEngine(data_provider=provider)
 
-# --- Pydantic Data Models (Defines the exact JSON structure the scraper sends) ---
-class MovieProfileModel(BaseModel):
-    is_action: bool = False
-    is_scifi: bool = False
-    is_comedy: bool = False
-    runtime_min: int = 120
 
-class RankingRequestModel(BaseModel):
-    movie_name: str
-    guessed_format: Optional[str] = "" 
-    needs_accessibility: bool = False
-    movie_profile: MovieProfileModel
-
-
-@app.post("/recommend")
-def get_recommendations(req: RankingRequestModel):
+def get_recommendations(req: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Endpoint for the Scraper/Frontend to get theater rankings.
+    REST-style entrypoint that accepts a plain dictionary payload and returns
+    the same theater ranking response previously exposed by the API.
     """
-    # Safety map to prevent scraper from sending junk format names
     format_map = {
         "IMAX_LASER": "IMAX_LASER",
         "IMAX_2D": "IMAX_2D",
@@ -426,34 +591,33 @@ def get_recommendations(req: RankingRequestModel):
         "PVR_PXL": "PVR_PXL",
         "STANDARD_2D": "STANDARD_2D",
     }
-    
-    clean_guess = req.guessed_format.strip().upper() if req.guessed_format else ""
-    is_cold_start = clean_guess == ""
-    
-    # If the scraper didn't give a format, default to the safe cold-start fallback
-    requested_format = format_map.get(clean_guess, "__COLD_START_UNKNOWN__")
 
-    # Run Inference
+    payload = dict(req or {})
+    guessed_format = str(payload.get("guessed_format", "") or "").strip().upper()
+    is_cold_start = guessed_format == ""
+    requested_format = format_map.get(guessed_format, "__COLD_START_UNKNOWN__")
+
+    movie_profile = payload.get("movie_profile", {}) or {}
+    if not isinstance(movie_profile, dict):
+        movie_profile = {}
+
     results = ml_system.rank_theaters_for_user(
         requested_format=requested_format,
-        needs_accessibility=req.needs_accessibility,
-        movie_profile=req.movie_profile.dict()
+        needs_accessibility=bool(payload.get("needs_accessibility", False)),
+        movie_profile=movie_profile,
     )
 
     return {
         "status": "success",
-        "movie": req.movie_name,
+        "movie": payload.get("movie_name", "unknown"),
         "is_cold_start": is_cold_start,
         "optimized_format_target": requested_format,
-        "rankings": results
+        "rankings": results,
     }
 
+
 # =====================================================================
-# 7. SERVER RUNNER
+# 7. OPTIONAL CLI/HTTP SHIM
 # =====================================================================
 if __name__ == "__main__":
-    # DO NOT paste this file using terminal `<<EOF`! Save it in your text editor.
-    # To run the API server, run this in your terminal:
-    # python THE_BACKEND/ibin.py
-    print("\n🚀 Starting FastAPI Server on port 8000...")
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    print("\n🚀 Recommendation engine ready. Use the get_recommendations(payload) function directly.")

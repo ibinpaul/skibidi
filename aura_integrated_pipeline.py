@@ -1,3 +1,4 @@
+import os
 import re
 import time
 import math
@@ -12,10 +13,7 @@ from typing import Dict, List, Any, Optional, Iterable
 from collections import Counter
 from sklearn.ensemble import RandomForestRegressor
 
-# FastAPI Imports
-from fastapi import FastAPI
-from pydantic import BaseModel
-import uvicorn
+from supabase_config import create_supabase_client, get_supabase_credentials
 
 from rich.console import Console
 from rich.panel import Panel
@@ -253,29 +251,72 @@ class SupabaseDataProvider(BaseDataProvider):
 
     def get_format_knowledge_base(self) -> Dict[str, Dict[str, Any]]:
         try:
-            res = self.supabase.table('format_dictionary').select('*').execute()
+            res = self.supabase.table('format_dictionary').select('format_name, base_tier, has_motion_seats').execute()
             kb = {}
-            for row in res.data:
-                kb[row['format_name']] = {
-                    "tier": row['base_tier'],
-                    "has_motion": row['has_motion_seats']
-                }
-            return kb
+            for row in res.data or []:
+                fmt = row.get('format_name')
+                if fmt:
+                    kb[fmt] = {
+                        "tier": int(row.get('base_tier', 1)),
+                        "has_motion": bool(row.get('has_motion_seats', False)),
+                        "source": "supabase"
+                    }
+            if kb:
+                return kb
+            return {
+                "IMAX_LASER": {"tier": 5, "has_motion": False, "source": "fallback"},
+                "IMAX_2D": {"tier": 5, "has_motion": False, "source": "fallback"},
+                "DOLBY_CINEMA": {"tier": 5, "has_motion": False, "source": "fallback"},
+                "4DX": {"tier": 4, "has_motion": True, "source": "fallback"},
+                "PVR_PXL": {"tier": 4, "has_motion": False, "source": "fallback"},
+                "STANDARD_2D": {"tier": 1, "has_motion": False, "source": "fallback"},
+            }
         except Exception as e:
             print(f"⚠️ Supabase Error: Could not fetch knowledge base. ({e})")
             return {}
 
     def get_available_theaters(self) -> List[Dict[str, Any]]:
         try:
-            res = self.supabase.table('theaters').select('*, theater_screens(format_name)').execute()
+            cinemas_res = self.supabase.table('cinemas').select('cinema_id, name, city').execute()
+            features_res = self.supabase.table('cinema_features').select('cinema_id, supports_disabled_hosting').execute()
+            features_by_cinema = {
+                row.get('cinema_id'): row
+                for row in features_res.data or []
+                if row.get('cinema_id') is not None
+            }
+            showtimes_res = self.supabase.table('showtimes').select('screen_id').execute()
+            active_screen_ids = {row.get('screen_id') for row in showtimes_res.data or [] if row.get('screen_id') is not None}
+
+            screen_formats_res = self.supabase.table('screen_formats').select('screen_id, format_name').execute()
+            formats_by_screen = {}
+            for row in screen_formats_res.data or []:
+                screen_id = row.get('screen_id')
+                fmt = row.get('format_name')
+                if screen_id is not None and fmt:
+                    formats_by_screen.setdefault(screen_id, []).append(fmt)
+
             theaters = []
-            for row in res.data:
-                screens = [s['format_name'] for s in row.get('theater_screens', [])]
+            for row in cinemas_res.data or []:
+                cinema_id = row.get('cinema_id')
+                screens_res = self.supabase.table('screens').select('screen_id, name, aspect_ratio').eq('cinema_id', cinema_id).execute()
+                screens = []
+                for screen in screens_res.data or []:
+                    screen_id = screen.get('screen_id')
+                    if screen_id is None or screen_id not in active_screen_ids:
+                        continue
+                    formats = formats_by_screen.get(screen_id, [])
+                    if not formats and screen.get('aspect_ratio'):
+                        formats = ['STANDARD_2D']
+                    if formats:
+                        screens.extend(formats)
+                if not screens:
+                    continue
+                feature_row = features_by_cinema.get(cinema_id, {})
                 theaters.append({
-                    "id": row['id'],
-                    "name": row['name'],
-                    "distance_km": row['distance_km'],
-                    "has_step_free_access": row['has_step_free_access'],
+                    "id": str(cinema_id),
+                    "name": row.get('name', f'Cinema {cinema_id}'),
+                    "distance_km": 10.0,
+                    "has_step_free_access": bool(feature_row.get('supports_disabled_hosting', False)),
                     "screens": screens
                 })
             return theaters
@@ -296,18 +337,30 @@ class SupabaseDataProvider(BaseDataProvider):
 
     def get_booking_history(self) -> List[Dict[str, Any]]:
         try:
-            res = (
-                self.supabase.table('training_feedback')
-                .select('selected_theater_id, format_name, genre_bucket, query_id, created_at')
-                .execute()
-            )
+            bookings_res = self.supabase.table('bookings').select('showtime_id, created_at').execute()
             history = []
-            for row in res.data:
+            for row in bookings_res.data or []:
+                showtime_id = row.get('showtime_id')
+                if not showtime_id:
+                    continue
+                showtime_res = self.supabase.table('showtimes').select('movie_id, screen_id').eq('showtime_id', showtime_id).execute()
+                if not showtime_res.data:
+                    continue
+                showtime = showtime_res.data[0]
+                screen_id = showtime.get('screen_id')
+                screen_res = self.supabase.table('screens').select('cinema_id').eq('screen_id', screen_id).execute()
+                if not screen_res.data:
+                    continue
+                cinema_id = screen_res.data[0].get('cinema_id')
+                fmt_name = 'STANDARD_2D'
+                formats_res = self.supabase.table('screen_formats').select('format_name').eq('screen_id', screen_id).execute()
+                if formats_res.data:
+                    fmt_name = formats_res.data[0].get('format_name') or fmt_name
                 history.append({
-                    "theater_id": row.get('selected_theater_id'),
-                    "format_name": row.get('format_name'),
-                    "genre_bucket": row.get('genre_bucket', 'general'),
-                    "film_id": row.get('query_id'),
+                    "theater_id": str(cinema_id),
+                    "format_name": fmt_name,
+                    "genre_bucket": 'general',
+                    "film_id": str(showtime.get('movie_id', 'unknown')),
                     "timestamp": row.get('created_at', time.time()),
                 })
             return history
@@ -499,29 +552,18 @@ class AuraMLEngine:
 
 
 # =====================================================================
-# 6. FASTAPI APPLICATION SETUP
+# 6. REST-STYLE ENTRYPOINT
 # =====================================================================
-app = FastAPI(title="Aura ML API Engine", description="Recommends the best theaters using ML.")
-
-USE_SUPABASE = False 
-provider = SupabaseDataProvider("", "") if USE_SUPABASE else MockDataProvider()
+url, key = get_supabase_credentials()
+USE_SUPABASE = bool(url and key)
+if USE_SUPABASE:
+    provider = SupabaseDataProvider(url, key)
+else:
+    provider = MockDataProvider()
 ml_system = AuraMLEngine(data_provider=provider)
 
-class MovieProfileModel(BaseModel):
-    is_action: bool = False
-    is_scifi: bool = False
-    is_comedy: bool = False
-    runtime_min: int = 120
 
-class RankingRequestModel(BaseModel):
-    movie_name: str
-    guessed_format: Optional[str] = "" 
-    needs_accessibility: bool = False
-    movie_profile: MovieProfileModel
-
-
-@app.post("/recommend")
-def get_recommendations(req: RankingRequestModel):
+def get_recommendations(req: Dict[str, Any]) -> Dict[str, Any]:
     format_map = {
         "IMAX_LASER": "IMAX_LASER",
         "IMAX_2D": "IMAX_2D",
@@ -530,23 +572,27 @@ def get_recommendations(req: RankingRequestModel):
         "PVR_PXL": "PVR_PXL",
         "STANDARD_2D": "STANDARD_2D",
     }
-    
-    clean_guess = req.guessed_format.strip().upper() if req.guessed_format else ""
-    requested_format = format_map.get(clean_guess, "STANDARD_2D")
+
+    payload = dict(req or {})
+    guessed_format = str(payload.get("guessed_format", "") or "").strip().upper()
+    requested_format = format_map.get(guessed_format, "STANDARD_2D")
+
+    movie_profile = payload.get("movie_profile", {}) or {}
+    if not isinstance(movie_profile, dict):
+        movie_profile = {}
 
     results = ml_system.rank_theaters_for_user(
         requested_format=requested_format,
-        needs_accessibility=req.needs_accessibility,
-        movie_profile=req.movie_profile.dict()
+        needs_accessibility=bool(payload.get("needs_accessibility", False)),
+        movie_profile=movie_profile,
     )
 
-    # Grabs ONLY the single top recommended theater
     top_recommendation = results[0] if results else None
 
     return {
         "status": "success",
-        "movie": req.movie_name,
-        "top_recommendation": top_recommendation
+        "movie": payload.get("movie_name", "unknown"),
+        "top_recommendation": top_recommendation,
     }
 
 
