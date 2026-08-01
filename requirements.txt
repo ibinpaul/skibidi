@@ -5,3 +5,5 @@ fastapi
 uvicorn
 pydantic
 supabase
+requests
+beautifulsoup4

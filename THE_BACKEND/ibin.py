@@ -1,212 +1,173 @@
-import time
+import os
 import math
+import logging
 import random
 import numpy as np
-import pandas as pd
 from abc import ABC, abstractmethod
 from typing import Dict, List, Any, Optional, Iterable
 from collections import Counter
 from sklearn.ensemble import RandomForestRegressor
 
-# --- NEW: FastAPI Imports ---
-from fastapi import FastAPI
+# --- FastAPI & REST Imports ---
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
+import madhev
+
+# --- Supabase Import ---
+from supabase import create_client, Client
+
+# Configure production logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+logger = logging.getLogger("aura_ml_api")
+
 
 # =====================================================================
-# 1. DATA PROVIDER INTERFACE
+# UTILITY FUNCTIONS
+# =====================================================================
+def calculate_haversine_distance(lat1: Optional[float], lon1: Optional[float], lat2: Optional[float], lon2: Optional[float]) -> float:
+    if lat1 is None or lon1 is None or lat2 is None or lon2 is None:
+        return 5.0
+    R = 6371.0
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = math.sin(dlat / 2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon / 2)**2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return round(R * c, 2)
+
+def parse_screen_format(screen_name: str) -> str:
+    name_upper = (screen_name or "").upper().strip()
+    if "IMAX LASER" in name_upper or "IMAX 3D" in name_upper: return "IMAX_LASER"
+    elif "IMAX" in name_upper: return "IMAX_2D"
+    elif "DOLBY" in name_upper or "ATMOS" in name_upper: return "DOLBY_CINEMA"
+    elif "4DX" in name_upper or "MX4D" in name_upper: return "4DX"
+    elif "PXL" in name_upper or "BIGPIX" in name_upper or "ICE" in name_upper: return "PVR_PXL"
+    elif "SCREENX" in name_upper: return "SCREENX"
+    return "STANDARD_2D"
+
+
+# =====================================================================
+# DATA PROVIDERS
 # =====================================================================
 class BaseDataProvider(ABC):
     @abstractmethod
-    def get_format_knowledge_base(self) -> Dict[str, Dict[str, Any]]:
-        pass
-
+    def get_format_knowledge_base(self) -> Dict[str, Dict[str, Any]]: pass
     @abstractmethod
-    def get_available_theaters(self) -> List[Dict[str, Any]]:
-        pass
-
+    def get_available_theaters(self, movie_name: Optional[str] = None, user_lat: Optional[float] = None, user_lon: Optional[float] = None) -> List[Dict[str, Any]]: pass
     @abstractmethod
-    def log_user_interaction(self, query_id: str, selected_theater_id: str, reward: float):
-        pass
+    def get_booking_history(self) -> List[Dict[str, Any]]: pass
 
-    @abstractmethod
-    def get_booking_history(self) -> List[Dict[str, Any]]:
-        pass
-
-
-# =====================================================================
-# 2. CURRENT IMPLEMENTATION: MOCK DATA PROVIDER
-# =====================================================================
 class MockDataProvider(BaseDataProvider):
-    def __init__(self):
-        self.kb = {
-            "IMAX_LASER": {"tier": 5, "has_motion": False, "source": "mock"},
-            "IMAX_2D": {"tier": 5, "has_motion": False, "source": "mock"},
-            "DOLBY_CINEMA": {"tier": 5, "has_motion": False, "source": "mock"},
-            "4DX": {"tier": 4, "has_motion": True, "source": "mock"},
-            "PVR_PXL": {"tier": 4, "has_motion": False, "source": "mock"},
-            "STANDARD_2D": {"tier": 1, "has_motion": False, "source": "mock"}
+    def get_format_knowledge_base(self):
+        return {
+            "IMAX_LASER": {"tier": 5, "has_motion": False},
+            "IMAX_2D": {"tier": 5, "has_motion": False},
+            "DOLBY_CINEMA": {"tier": 5, "has_motion": False},
+            "4DX": {"tier": 4, "has_motion": True},
+            "PVR_PXL": {"tier": 4, "has_motion": False},
+            "SCREENX": {"tier": 3, "has_motion": False},
+            "STANDARD_2D": {"tier": 1, "has_motion": False}
         }
-        self.theaters = [
-            {
-                "id": "TH-101",
-                "name": "PVR Lulu Mall",
-                "distance_km": 2.2,
-                "has_step_free_access": True,
-                "screens": ["IMAX_LASER", "4DX", "DOLBY_CINEMA"]
-            },
-            {
-                "id": "TH-102",
-                "name": "Shenoys Cinemas",
-                "distance_km": 1.5,
-                "has_step_free_access": False,
-                "screens": ["4DX", "STANDARD_2D"]
-            },
-            {
-                "id": "TH-103",
-                "name": "Forum Mall Cinepolis",
-                "distance_km": 12.8,  # Far away, but has premium screens
-                "has_step_free_access": True,
-                "screens": ["IMAX_2D", "PVR_PXL", "STANDARD_2D"]
-            },
-            {
-                "id": "TH-104",
-                "name": "Navrang Local Talkies",
-                "distance_km": 0.8,  # Very close, standard only
-                "has_step_free_access": True,
-                "screens": ["STANDARD_2D"]
-            }
+    def get_available_theaters(self, movie_name=None, user_lat=None, user_lon=None):
+        return [
+            {"id": "1", "name": "PVR Lulu Mall", "distance_km": 2.2, "has_step_free_access": True, "screens": ["IMAX_LASER", "4DX", "DOLBY_CINEMA"]},
+            {"id": "2", "name": "Shenoys Cinemas", "distance_km": 1.5, "has_step_free_access": False, "screens": ["4DX", "STANDARD_2D"]}
         ]
-        self.interaction_logs = []
-        self.booking_history = self._generate_mock_booking_history()
+    def get_booking_history(self):
+        return []
 
-    def get_format_knowledge_base(self) -> Dict[str, Dict[str, Any]]:
-        return {format_name: metadata.copy() for format_name, metadata in self.kb.items()}
-
-    def get_available_theaters(self) -> List[Dict[str, Any]]:
-        return [{**theater, "screens": list(theater.get("screens", []))} for theater in self.theaters]
-
-    def log_user_interaction(self, query_id: str, selected_theater_id: str, reward: float):
-        self.interaction_logs.append({
-            "query_id": query_id,
-            "theater_id": selected_theater_id,
-            "reward": reward,
-            "source": "mock",
-            "logged_at": time.time()
-        })
-        print(f"  [Mock Storage Logged] User picked '{selected_theater_id}' with score reward {reward}")
-
-    def get_booking_history(self) -> List[Dict[str, Any]]:
-        return [dict(record) for record in self.booking_history]
-
-    def _generate_mock_booking_history(self, n: int = 4000) -> List[Dict[str, Any]]:
-        rng = random.Random(7)
-        genre_format_weights = {
-            "scifi":   {"IMAX_LASER": 6, "IMAX_2D": 5, "DOLBY_CINEMA": 4, "4DX": 2, "PVR_PXL": 2, "STANDARD_2D": 1},
-            "action":  {"4DX": 6, "IMAX_LASER": 3, "DOLBY_CINEMA": 2, "IMAX_2D": 2, "PVR_PXL": 2, "STANDARD_2D": 1},
-            "comedy":  {"STANDARD_2D": 5, "PVR_PXL": 2, "DOLBY_CINEMA": 1, "IMAX_2D": 1, "IMAX_LASER": 1, "4DX": 1},
-            "general": {"STANDARD_2D": 3, "IMAX_LASER": 2, "DOLBY_CINEMA": 2, "IMAX_2D": 2, "4DX": 2, "PVR_PXL": 2},
-        }
-        genre_buckets = list(genre_format_weights.keys())
-
-        history = []
-        for _ in range(n):
-            genre = rng.choice(genre_buckets)
-            weights = genre_format_weights[genre]
-            candidate_formats = list(weights.keys())
-            w = [weights[f] for f in candidate_formats]
-            fmt = rng.choices(candidate_formats, weights=w, k=1)[0]
-
-            eligible_theaters = [t for t in self.theaters if fmt in t["screens"]]
-            if not eligible_theaters:
-                continue
-            theater = rng.choice(eligible_theaters)
-
-            history.append({
-                "theater_id": theater["id"],
-                "format_name": fmt,
-                "genre_bucket": genre,
-                "film_id": f"FILM-{rng.randint(1, 250)}",
-                "timestamp": time.time() - rng.randint(0, 60 * 60 * 24 * 90),
-            })
-        return history
-
-
-# =====================================================================
-# 3. FUTURE IMPLEMENTATION: SUPABASE DATA PROVIDER
-# =====================================================================
 class SupabaseDataProvider(BaseDataProvider):
-    def __init__(self, supabase_url: str, supabase_key: str):
-        from supabase import create_client
-        self.supabase = create_client(supabase_url, supabase_key)
+    def __init__(self, supabase_client: Client):
+        self.supabase = supabase_client
+
+    def _fallback_knowledge_base(self):
+        return {
+            "IMAX_LASER": {"tier": 5, "has_motion": False},
+            "IMAX_2D": {"tier": 5, "has_motion": False},
+            "DOLBY_CINEMA": {"tier": 5, "has_motion": False},
+            "4DX": {"tier": 4, "has_motion": True},
+            "PVR_PXL": {"tier": 4, "has_motion": False},
+            "SCREENX": {"tier": 3, "has_motion": False},
+            "STANDARD_2D": {"tier": 1, "has_motion": False}
+        }
 
     def get_format_knowledge_base(self) -> Dict[str, Dict[str, Any]]:
         try:
             res = self.supabase.table('format_dictionary').select('*').execute()
-            kb = {}
-            for row in res.data:
-                kb[row['format_name']] = {
-                    "tier": row['base_tier'],
-                    "has_motion": row['has_motion_seats']
-                }
-            return kb
+            if not res or not res.data: return self._fallback_knowledge_base()
+            return {row['format_name']: {"tier": row['base_tier'], "has_motion": row['has_motion_seats']} for row in res.data}
         except Exception as e:
-            print(f"⚠️ Supabase Error: Could not fetch knowledge base. ({e})")
-            return {}
+            logger.error(f"KB Error, using fallback: {e}")
+            return self._fallback_knowledge_base()
 
-    def get_available_theaters(self) -> List[Dict[str, Any]]:
+    def get_available_theaters(self, movie_name: Optional[str] = None, user_lat: Optional[float] = None, user_lon: Optional[float] = None) -> List[Dict[str, Any]]:
+        clean_movie = movie_name.strip() if movie_name else ""
         try:
-            res = self.supabase.table('theaters').select('*, theater_screens(format_name)').execute()
-            theaters = []
-            for row in res.data:
-                screens = [s['format_name'] for s in row.get('theater_screens', [])]
-                theaters.append({
-                    "id": row['id'],
-                    "name": row['name'],
-                    "distance_km": row['distance_km'],
-                    "has_step_free_access": row['has_step_free_access'],
-                    "screens": screens
-                })
-            return theaters
+            if clean_movie:
+                res = self.supabase.table('movies').select(
+                    'movie_id, title, showtimes(screens(screen_id, name, cinemas(cinema_id, name, latitude, longitude, cinema_features(supports_disabled_hosting))))'
+                ).ilike('title', f"%{clean_movie}%").execute()
+
+                if not res or not res.data:
+                    logger.warning(f"Movie '{clean_movie}' not found. Falling back to all cinemas.")
+                    return self._get_all_theaters_fallback(user_lat, user_lon)
+
+                target_movie = next((m for m in res.data if m.get('title', '').strip().lower() == clean_movie.lower()), res.data[0])
+
+                cinemas_map = {}
+                for showtime in target_movie.get('showtimes') or []:
+                    screen = showtime.get('screens') or {}
+                    cinema = screen.get('cinemas') or {}
+                    cinema_id = cinema.get('cinema_id')
+                    if not cinema_id: continue
+
+                    if cinema_id not in cinemas_map:
+                        features = cinema.get('cinema_features') or {}
+                        if isinstance(features, list) and len(features) > 0: features = features[0]
+                        has_access = features.get('supports_disabled_hosting', False) if isinstance(features, dict) else False
+                        
+                        dist_km = calculate_haversine_distance(user_lat, user_lon, cinema.get('latitude'), cinema.get('longitude'))
+                        cinemas_map[cinema_id] = {"id": str(cinema_id), "name": cinema.get('name', 'Unknown Cinema'), "distance_km": dist_km, "has_step_free_access": has_access, "screens": []}
+                    
+                    cinemas_map[cinema_id]["screens"].append(parse_screen_format(screen.get('name')))
+
+                return list(cinemas_map.values())
+            else:
+                return self._get_all_theaters_fallback(user_lat, user_lon)
         except Exception as e:
-            print(f"⚠️ Supabase Error: Could not fetch theaters. ({e})")
+            logger.error(f"DB Error: {e}")
             return []
 
-    def log_user_interaction(self, query_id: str, selected_theater_id: str, reward: float):
-        try:
-            self.supabase.table('training_feedback').insert({
-                "query_id": query_id,
-                "selected_theater_id": selected_theater_id,
-                "relevance_reward": reward
-            }).execute()
-            print(f"  [Supabase DB Logged] Training point saved for Query {query_id}")
-        except Exception as e:
-            print(f"⚠️ Supabase Error: Could not log interaction. ({e})")
+    def _get_all_theaters_fallback(self, user_lat: Optional[float], user_lon: Optional[float]) -> List[Dict[str, Any]]:
+        res = self.supabase.table('cinemas').select('cinema_id, name, latitude, longitude, cinema_features(supports_disabled_hosting), screens(name)').execute()
+        if not res or not res.data: return []
+        
+        theaters = []
+        for row in res.data:
+            features = row.get('cinema_features') or {}
+            if isinstance(features, list) and len(features) > 0: features = features[0]
+            dist_km = calculate_haversine_distance(user_lat, user_lon, row.get('latitude'), row.get('longitude'))
+            formats = [parse_screen_format(s.get('name')) for s in row.get('screens') or []]
+            theaters.append({
+                "id": str(row['cinema_id']),
+                "name": row['name'],
+                "distance_km": dist_km,
+                "has_step_free_access": features.get('supports_disabled_hosting', False) if isinstance(features, dict) else False,
+                "screens": formats
+            })
+        return theaters
 
     def get_booking_history(self) -> List[Dict[str, Any]]:
         try:
-            res = (
-                self.supabase.table('training_feedback')
-                .select('selected_theater_id, format_name, genre_bucket, query_id, created_at')
-                .execute()
-            )
-            history = []
-            for row in res.data:
-                history.append({
-                    "theater_id": row.get('selected_theater_id'),
-                    "format_name": row.get('format_name'),
-                    "genre_bucket": row.get('genre_bucket', 'general'),
-                    "film_id": row.get('query_id'),
-                    "timestamp": row.get('created_at', time.time()),
-                })
-            return history
-        except Exception as e:
-            print(f"⚠️ Supabase Error: Could not fetch booking history. ({e})")
+            res = self.supabase.table('training_feedback').select('selected_theater_id, format_name, genre_bucket, query_id, created_at').execute()
+            return res.data if res and res.data else []
+        except Exception:
             return []
 
 
 # =====================================================================
-# 4. POPULARITY-LIFT CALCULATOR
+# POPULARITY-LIFT CALCULATOR
 # =====================================================================
 class PreferenceLiftCalculator:
     def __init__(self, data_provider: BaseDataProvider, prior_weight: float = 8.0):
@@ -220,15 +181,13 @@ class PreferenceLiftCalculator:
             for fmt in t.get("screens", []):
                 format_screen_counts[fmt] += 1
                 total_screens += 1
-        if total_screens == 0:
-            return {}, 0
+        if total_screens == 0: return {}, 0
         return {fmt: count / total_screens for fmt, count in format_screen_counts.items()}, total_screens
 
     def _smoothed_lift(self, bookings: Iterable[Dict[str, Any]], availability_shares: Dict[str, float], prior_means: Optional[Dict[str, float]] = None) -> Dict[str, float]:
         bookings = list(bookings)
         total_bookings = len(bookings)
         booking_counts = Counter(b["format_name"] for b in bookings)
-
         lift = {}
         for fmt, avail_share in availability_shares.items():
             observed = booking_counts.get(fmt, 0)
@@ -237,147 +196,163 @@ class PreferenceLiftCalculator:
             lift[fmt] = (observed + self.prior_weight * prior_mean) / (expected + self.prior_weight)
         return lift
 
-    def compute_overall_lift(self) -> Dict[str, float]:
-        theaters = self.data_provider.get_available_theaters()
-        booking_history = self.data_provider.get_booking_history()
-        availability_shares, _ = self._availability_shares(theaters)
-        return self._smoothed_lift(booking_history, availability_shares, prior_means=None)
-
     def compute_genre_lift(self, active_genres: List[str]) -> Dict[str, float]:
         theaters = self.data_provider.get_available_theaters()
         booking_history = self.data_provider.get_booking_history()
         availability_shares, _ = self._availability_shares(theaters)
-
+        
         overall_lift = self._smoothed_lift(booking_history, availability_shares, prior_means=None)
-
-        if not active_genres:
-            return overall_lift
-
+        if not active_genres: return overall_lift
+        
         genre_set = set(active_genres)
         genre_bookings = [b for b in booking_history if b.get("genre_bucket") in genre_set]
         return self._smoothed_lift(genre_bookings, availability_shares, prior_means=overall_lift)
 
-    def get_lift(self, format_name: str, active_genres: Optional[List[str]] = None) -> float:
-        lift_map = self.compute_genre_lift(active_genres or [])
-        return lift_map.get(format_name, 1.0)
-
 
 # =====================================================================
-# 5. TRUE ML ENGINE
+# TRUE ML ENGINE (18-FEATURE EXPANDED ARRAY)
 # =====================================================================
 class AuraMLEngine:
     def __init__(self, data_provider: BaseDataProvider):
         self.data_provider = data_provider
         self.model = RandomForestRegressor(n_estimators=50, max_depth=6, random_state=42)
-        self.is_trained = False
         self.lift_calculator = PreferenceLiftCalculator(data_provider)
         self._train_synthetic_model()
 
     def _train_synthetic_model(self):
-        print("\n⚙️  [ML Pipeline] Generating 5,000 synthetic training records (Multi-Genre Overlap + Lift)...")
+        logger.info("[ML Pipeline] Training Random Forest model with full 10-genre matrix...")
         X_train, y_train = [], []
-        for _ in range(5000):
-            is_exact_match = random.choice([1, 0])
+        for _ in range(8000): # Increased samples for broader feature set
+            is_exact_match, has_motion, needs_access, has_access = [random.choice([1, 0]) for _ in range(4)]
             screen_tier = random.randint(1, 5)
-            has_motion = random.choice([1, 0])
             dist_km = round(random.uniform(0.5, 25.0), 1)
-            needs_access = random.choice([1, 0])
-            has_access = random.choice([1, 0])
             runtime_min = random.randint(85, 190)
+            
+            # Genre generation probabilities
+            is_action = 1 if random.random() < 0.30 else 0
+            is_scifi = 1 if random.random() < 0.20 else 0
+            is_comedy = 1 if random.random() < 0.25 else 0
+            is_horror = 1 if random.random() < 0.15 else 0
+            is_drama = 1 if random.random() < 0.30 else 0
+            is_romance = 1 if random.random() < 0.15 else 0
+            is_thriller = 1 if random.random() < 0.20 else 0
+            is_animation = 1 if random.random() < 0.15 else 0
+            is_fantasy = 1 if random.random() < 0.15 else 0
+            is_family = 1 if random.random() < 0.20 else 0
 
-            is_action = 1 if random.random() < 0.40 else 0
-            is_scifi = 1 if random.random() < 0.25 else 0
-            is_comedy = 1 if random.random() < 0.35 else 0
+            format_lift = max(0.2, min(3.5, float(np.random.lognormal(mean=0.0, sigma=0.4))))
 
-            format_lift = float(np.random.lognormal(mean=0.0, sigma=0.4))
-            format_lift = max(0.2, min(3.5, format_lift))
-
-            score = 30.0
-            if is_exact_match: score += 40.0
-            score += (screen_tier * 4.0)
-            if is_action and has_motion: score += 15.0
-            if has_motion and runtime_min > 150: score -= 15.0
-            if is_scifi and screen_tier >= 4: score += 18.0
-
-            if is_comedy and not is_action: score -= (dist_km * 3.5)
-            else: score -= (dist_km * 1.5)
-
+            # Base Scoring
+            score = 30.0 + (screen_tier * 4.0) + (40.0 if is_exact_match else 0)
             score += (format_lift - 1.0) * 15.0
+            
+            # Accessibility Rules
             if needs_access and not has_access: score = 0.0
             elif needs_access and has_access: score += 20.0
 
-            score += random.uniform(-5.0, 5.0)
-            score = max(0.0, min(100.0, score))
+            # Distance Penalties based on genre engagement
+            casual_movie = is_comedy or is_family or is_romance
+            epic_movie = is_action or is_scifi or is_fantasy
+            score -= (dist_km * (3.5 if casual_movie and not epic_movie else 1.5))
 
+            # --- SYNTHETIC GENRE RULES ---
+            # Motion (4DX) Rules
+            if has_motion:
+                if is_action or is_horror or is_fantasy: score += 18.0
+                if is_drama or is_romance: score -= 25.0 # Motion is terrible for serious dialogue
+                if runtime_min > 150: score -= 15.0 # Too long in a moving seat
+
+            # Premium Format (IMAX/Dolby - Tiers 4/5) Rules
+            if screen_tier >= 4:
+                if epic_movie: score += 20.0
+                if is_animation or is_thriller: score += 10.0
+                if is_family and not is_animation: score -= 5.0 # Expensive for large groups
+
+            # Standard 2D (Tier 1/2) Rules
+            if screen_tier <= 2:
+                if is_drama or is_romance or is_comedy: score += 15.0 # Perfectly suited
+            
+            score = max(0.0, min(100.0, score + random.uniform(-5.0, 5.0)))
+            
+            # 18 Features Exact Order
             X_train.append([
-                is_exact_match, screen_tier, has_motion, dist_km,
-                needs_access, has_access, runtime_min,
-                is_action, is_scifi, is_comedy, format_lift,
+                is_exact_match, screen_tier, has_motion, dist_km, needs_access, has_access, runtime_min, 
+                format_lift, # 8 Core Features
+                is_action, is_scifi, is_comedy, is_horror, is_drama, 
+                is_romance, is_thriller, is_animation, is_fantasy, is_family # 10 Genre Features
             ])
             y_train.append(score)
 
-        print("🧠 [ML Pipeline] Training RandomForestRegressor...")
         self.model.fit(X_train, y_train)
-        self.is_trained = True
-        print("✅ [ML Pipeline] Model successfully trained!")
+        logger.info("[ML Pipeline] Model successfully trained on 18-feature array!")
 
-    def rank_theaters_for_user(
-        self, requested_format: str, needs_accessibility: bool, movie_profile: Dict[str, Any]
-    ) -> List[Dict[str, Any]]:
-
+    def rank_theaters_for_user(self, requested_format: str, needs_accessibility: bool, movie_profile: Dict[str, Any], movie_name: Optional[str] = None, user_lat: Optional[float] = None, user_lon: Optional[float] = None) -> List[Dict[str, Any]]:
+        
+        # Safely extract all 10 genres from payload
         is_action = 1 if movie_profile.get("is_action") else 0
         is_scifi = 1 if movie_profile.get("is_scifi") else 0
         is_comedy = 1 if movie_profile.get("is_comedy") else 0
+        is_horror = 1 if movie_profile.get("is_horror") else 0
+        is_drama = 1 if movie_profile.get("is_drama") else 0
+        is_romance = 1 if movie_profile.get("is_romance") else 0
+        is_thriller = 1 if movie_profile.get("is_thriller") else 0
+        is_animation = 1 if movie_profile.get("is_animation") else 0
+        is_fantasy = 1 if movie_profile.get("is_fantasy") else 0
+        is_family = 1 if movie_profile.get("is_family") else 0
+
         needs_access_flag = 1 if needs_accessibility else 0
         runtime_min = float(movie_profile.get("runtime_min", 120))
-
-        active_genres = []
-        if is_scifi: active_genres.append("scifi")
-        if is_action: active_genres.append("action")
-        if is_comedy: active_genres.append("comedy")
-        if not active_genres: active_genres = ["general"]
+        
+        # Build Active Genres array for Bayesian Lift
+        genre_keys = ["action", "scifi", "comedy", "horror", "drama", "romance", "thriller", "animation", "fantasy", "family"]
+        genre_vals = [is_action, is_scifi, is_comedy, is_horror, is_drama, is_romance, is_thriller, is_animation, is_fantasy, is_family]
+        active_genres = [g for g, v in zip(genre_keys, genre_vals) if v] or ["general"]
 
         kb = self.data_provider.get_format_knowledge_base()
-        theaters = self.data_provider.get_available_theaters()
+        theaters = self.data_provider.get_available_theaters(movie_name=movie_name, user_lat=user_lat, user_lon=user_lon)
         lift_map = self.lift_calculator.compute_genre_lift(active_genres)
+        
         ranked_results = []
 
         for t in theaters:
             screens = [str(s) for s in t.get("screens", [])]
             if not screens: continue
 
-            dist_km = float(t.get("distance_km", 10.0))
+            dist_km = float(t.get("distance_km", 5.0))
             has_access_flag = 1 if t.get("has_step_free_access", False) else 0
-
             best_screen_score = 0.0
             best_matched_fmt = "NONE"
             best_lift = 1.0
 
-            for screen_format in screens:
+            for screen_format in set(screens):
                 screen_meta = kb.get(screen_format, {})
                 format_lift = lift_map.get(screen_format, 1.0)
+                
+                # 18 Features Exact Order Match for Inference
                 features = np.array([[
                     1 if screen_format == requested_format else 0,
                     float(screen_meta.get("tier", 1)),
                     1 if screen_meta.get("has_motion") else 0,
-                    dist_km, needs_access_flag, has_access_flag,
-                    runtime_min, is_action, is_scifi, is_comedy, format_lift,
+                    dist_km, needs_access_flag, has_access_flag, runtime_min, 
+                    format_lift,
+                    is_action, is_scifi, is_comedy, is_horror, is_drama, 
+                    is_romance, is_thriller, is_animation, is_fantasy, is_family
                 ]])
                 
-                ml_predicted_score = self.model.predict(features)[0]
-
+                ml_predicted_score = float(self.model.predict(features)[0])
+                
                 if ml_predicted_score > best_screen_score:
                     best_screen_score = ml_predicted_score
                     best_matched_fmt = screen_format
                     best_lift = format_lift
 
             reason = f"ML Score based on distance ({dist_km}km), format & preference-lift ({best_lift:.2f}x)"
-            if needs_accessibility and has_access_flag == 0:
-                reason = "Accessibility dealbreaker"
+            if needs_accessibility and has_access_flag == 0: reason = "Accessibility dealbreaker"
 
             ranked_results.append({
                 "id": t["id"],
                 "name": t["name"],
+                "distance_km": dist_km,
                 "matched_format": best_matched_fmt,
                 "reason": reason,
                 "lift": round(best_lift, 2),
@@ -388,72 +363,105 @@ class AuraMLEngine:
 
 
 # =====================================================================
-# 6. FASTAPI APPLICATION SETUP
+# REST API CONTROLLERS (FastAPI)
 # =====================================================================
+app = FastAPI(title="Aura ML Recommendations API", version="1.1.0")
 
-app = FastAPI(title="Aura ML API Engine", description="Recommends the best theaters using ML.")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# Initialize Provider & Engine ONE time when server starts (prevents re-training on every API hit)
-USE_SUPABASE = False 
-provider = SupabaseDataProvider("", "") if USE_SUPABASE else MockDataProvider()
+# --- DB INIT ---
+USE_SUPABASE = os.environ.get("USE_SUPABASE", "false").lower() == "true"
+if USE_SUPABASE:
+    provider = SupabaseDataProvider(create_client(os.environ.get("SUPABASE_URL"), os.environ.get("SUPABASE_KEY")))
+else:
+    provider = MockDataProvider()
 ml_system = AuraMLEngine(data_provider=provider)
 
-# --- Pydantic Data Models (Defines the exact JSON structure the scraper sends) ---
+# Initialize and mount SeatSelectionRBA router if Supabase is available
+try:
+    if USE_SUPABASE and hasattr(provider, 'supabase'):
+        madhev.rba_engine = madhev.SeatSelectionRBA(provider.supabase)
+        app.include_router(madhev.seat_router, prefix="/rba")
+    else:
+        # If not using Supabase we still mount the router but leave engine uninitialized
+        app.include_router(madhev.seat_router, prefix="/rba")
+except Exception as _e:
+    logger.warning(f"Could not initialize Seat RBA router: {_e}")
+
+# --- REQUEST / RESPONSE JSON MODELS ---
 class MovieProfileModel(BaseModel):
     is_action: bool = False
     is_scifi: bool = False
     is_comedy: bool = False
+    is_horror: bool = False
+    is_drama: bool = False
+    is_romance: bool = False
+    is_thriller: bool = False
+    is_animation: bool = False
+    is_fantasy: bool = False
+    is_family: bool = False
     runtime_min: int = 120
 
 class RankingRequestModel(BaseModel):
     movie_name: str
+    user_lat: Optional[float] = None
+    user_lon: Optional[float] = None
     guessed_format: Optional[str] = "" 
     needs_accessibility: bool = False
     movie_profile: MovieProfileModel
 
+class TheaterRankingResponseModel(BaseModel):
+    id: str
+    name: str
+    distance_km: float
+    matched_format: str
+    reason: str
+    lift: float
+    score: float
 
-@app.post("/recommend")
+class APIResponseModel(BaseModel):
+    status: str
+    movie: str
+    is_cold_start: bool
+    optimized_format_target: str
+    rankings: List[TheaterRankingResponseModel]
+
+# --- API ROUTES ---
+@app.get("/")
+def health_check():
+    return {"status": "online", "service": "Aura ML API"}
+
+@app.post("/recommend", response_model=APIResponseModel)
 def get_recommendations(req: RankingRequestModel):
-    """
-    Endpoint for the Scraper/Frontend to get theater rankings.
-    """
-    # Safety map to prevent scraper from sending junk format names
-    format_map = {
-        "IMAX_LASER": "IMAX_LASER",
-        "IMAX_2D": "IMAX_2D",
-        "DOLBY_CINEMA": "DOLBY_CINEMA",
-        "4DX": "4DX",
-        "PVR_PXL": "PVR_PXL",
-        "STANDARD_2D": "STANDARD_2D",
-    }
-    
-    clean_guess = req.guessed_format.strip().upper() if req.guessed_format else ""
-    is_cold_start = clean_guess == ""
-    
-    # If the scraper didn't give a format, default to the safe cold-start fallback
-    requested_format = format_map.get(clean_guess, "__COLD_START_UNKNOWN__")
+    if not req.movie_name.strip():
+        raise HTTPException(status_code=400, detail="movie_name cannot be empty.")
 
-    # Run Inference
+    clean_guess = req.guessed_format.strip().upper() if req.guessed_format else ""
+    requested_format = clean_guess if clean_guess else "__COLD_START_UNKNOWN__"
+
     results = ml_system.rank_theaters_for_user(
         requested_format=requested_format,
         needs_accessibility=req.needs_accessibility,
-        movie_profile=req.movie_profile.dict()
+        movie_profile=req.movie_profile.dict(),
+        movie_name=req.movie_name,
+        user_lat=req.user_lat,
+        user_lon=req.user_lon
     )
 
     return {
         "status": "success",
         "movie": req.movie_name,
-        "is_cold_start": is_cold_start,
+        "is_cold_start": clean_guess == "",
         "optimized_format_target": requested_format,
         "rankings": results
     }
 
-# =====================================================================
-# 7. SERVER RUNNER
-# =====================================================================
 if __name__ == "__main__":
-    # DO NOT paste this file using terminal `<<EOF`! Save it in your text editor.
-    # To run the API server, run this in your terminal:
-    # python THE_BACKEND/ibin.py
-    print("\n🚀 Starting FastAPI Server on port 8000...")
+    logger.info("Starting REST API on port 8000...")
     uvicorn.run(app, host="0.0.0.0", port=8000)
