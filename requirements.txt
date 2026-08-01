@@ -7,3 +7,4 @@ pydantic
 supabase
 requests
 beautifulsoup4
+python-dotenv

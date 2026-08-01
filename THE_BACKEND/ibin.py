@@ -3,6 +3,10 @@ import math
 import logging
 import random
 import numpy as np
+from pathlib import Path
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 from abc import ABC, abstractmethod
 from typing import Dict, List, Any, Optional, Iterable
 from collections import Counter
@@ -14,6 +18,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
 import madhev
+import scraper
+import owner
 
 # --- Supabase Import ---
 from supabase import create_client, Client
@@ -57,6 +63,10 @@ class BaseDataProvider(ABC):
     def get_available_theaters(self, movie_name: Optional[str] = None, user_lat: Optional[float] = None, user_lon: Optional[float] = None) -> List[Dict[str, Any]]: pass
     @abstractmethod
     def get_booking_history(self) -> List[Dict[str, Any]]: pass
+    @abstractmethod
+    def get_now_showing_movies(self) -> List[Dict[str, Any]]: pass
+    @abstractmethod
+    def get_movie_showtimes(self, movie_name: str) -> List[Dict[str, Any]]: pass
 
 class MockDataProvider(BaseDataProvider):
     def get_format_knowledge_base(self):
@@ -77,9 +87,33 @@ class MockDataProvider(BaseDataProvider):
     def get_booking_history(self):
         return []
 
+    def get_now_showing_movies(self):
+        return [
+            {"title": "Dune: Part Two", "guessed_format": "IMAX_LASER", "runtime_min": 166},
+            {"title": "Inside Out 2", "guessed_format": "DOLBY_CINEMA", "runtime_min": 96},
+            {"title": "Kalki 2898 AD", "guessed_format": "IMAX_2D", "runtime_min": 176},
+            {"title": "Deadpool & Wolverine", "guessed_format": "4DX", "runtime_min": 127},
+            {"title": "Aavesham", "guessed_format": "STANDARD_2D", "runtime_min": 158},
+        ]
+
+    def get_movie_showtimes(self, movie_name: str) -> List[Dict[str, Any]]:
+        slots = ["4:30 PM", "7:00 PM", "10:15 PM"]
+        showtimes = []
+        for cinema_id, cinema_name in [("1", "PVR Lulu Mall"), ("2", "Shenoys Cinemas")]:
+            for idx, slot in enumerate(slots):
+                showtimes.append({
+                    "cinema_id": cinema_id,
+                    "showtime_id": int(cinema_id) * 100 + idx + 1,
+                    "screen_id": int(cinema_id) * 10 + idx + 1,
+                    "starts_at": slot,
+                    "format_label": "IMAX Laser" if cinema_id == "1" and idx == 0 else "Dolby Cinema" if idx == 1 else "Standard 2D",
+                })
+        return showtimes
+
 class SupabaseDataProvider(BaseDataProvider):
     def __init__(self, supabase_client: Client):
         self.supabase = supabase_client
+        self._mock = MockDataProvider()
 
     def _fallback_knowledge_base(self):
         return {
@@ -110,8 +144,8 @@ class SupabaseDataProvider(BaseDataProvider):
                 ).ilike('title', f"%{clean_movie}%").execute()
 
                 if not res or not res.data:
-                    logger.warning(f"Movie '{clean_movie}' not found. Falling back to all cinemas.")
-                    return self._get_all_theaters_fallback(user_lat, user_lon)
+                    logger.warning(f"Movie '{clean_movie}' not found. Falling back to demo cinemas.")
+                    return self._mock.get_available_theaters(movie_name, user_lat, user_lon)
 
                 target_movie = next((m for m in res.data if m.get('title', '').strip().lower() == clean_movie.lower()), res.data[0])
 
@@ -130,14 +164,16 @@ class SupabaseDataProvider(BaseDataProvider):
                         dist_km = calculate_haversine_distance(user_lat, user_lon, cinema.get('latitude'), cinema.get('longitude'))
                         cinemas_map[cinema_id] = {"id": str(cinema_id), "name": cinema.get('name', 'Unknown Cinema'), "distance_km": dist_km, "has_step_free_access": has_access, "screens": []}
                     
-                    cinemas_map[cinema_id]["screens"].append(parse_screen_format(screen.get('name')))
+                    cinemas_map[cinema_id]["screens"].append(parse_screen_format(screen.get('name') or ''))
 
+                if not cinemas_map:
+                    return self._mock.get_available_theaters(movie_name, user_lat, user_lon)
                 return list(cinemas_map.values())
             else:
                 return self._get_all_theaters_fallback(user_lat, user_lon)
         except Exception as e:
             logger.error(f"DB Error: {e}")
-            return []
+            return self._mock.get_available_theaters(movie_name, user_lat, user_lon)
 
     def _get_all_theaters_fallback(self, user_lat: Optional[float], user_lon: Optional[float]) -> List[Dict[str, Any]]:
         res = self.supabase.table('cinemas').select('cinema_id, name, latitude, longitude, cinema_features(supports_disabled_hosting), screens(name)').execute()
@@ -164,6 +200,86 @@ class SupabaseDataProvider(BaseDataProvider):
             return res.data if res and res.data else []
         except Exception:
             return []
+
+    def get_now_showing_movies(self) -> List[Dict[str, Any]]:
+        try:
+            res = self.supabase.table('movies').select('title, runtime_min, runtime_minutes, duration_min, showtimes(screens(name))').limit(24).execute()
+            if not res or not res.data:
+                return self._mock.get_now_showing_movies()
+
+            movies: List[Dict[str, Any]] = []
+            for row in res.data:
+                title = (row.get('title') or '').strip()
+                if not title:
+                    continue
+
+                runtime = row.get('runtime_min') or row.get('runtime_minutes') or row.get('duration_min') or 120
+                try:
+                    runtime_min = int(runtime)
+                except Exception:
+                    runtime_min = 120
+
+                formats: List[str] = []
+                for showtime in row.get('showtimes') or []:
+                    screen = showtime.get('screens') or {}
+                    formats.append(parse_screen_format(screen.get('name') or ''))
+
+                guessed_format = Counter(formats).most_common(1)[0][0] if formats else 'STANDARD_2D'
+                movies.append({
+                    'title': title,
+                    'guessed_format': guessed_format,
+                    'runtime_min': runtime_min,
+                })
+
+            if not movies:
+                return self._mock.get_now_showing_movies()
+            return movies
+        except Exception as e:
+            logger.error(f"Now-showing query failed, using fallback: {e}")
+            return self._mock.get_now_showing_movies()
+
+    def get_movie_showtimes(self, movie_name: str) -> List[Dict[str, Any]]:
+        clean_movie = movie_name.strip() if movie_name else ""
+        try:
+            if not clean_movie:
+                return self._mock.get_movie_showtimes(movie_name)
+
+            res = self.supabase.table('movies').select(
+                'movie_id, title, showtimes(showtime_id, start_time, screens(screen_id, name, cinemas(cinema_id, name)))'
+            ).ilike('title', f"%{clean_movie}%").execute()
+
+            if not res or not res.data:
+                return self._mock.get_movie_showtimes(movie_name)
+
+            target_movie = next(
+                (m for m in res.data if m.get('title', '').strip().lower() == clean_movie.lower()),
+                res.data[0],
+            )
+
+            showtimes = []
+            for showtime in target_movie.get('showtimes') or []:
+                screen = showtime.get('screens') or {}
+                cinema = screen.get('cinemas') or {}
+                cinema_id = cinema.get('cinema_id')
+                screen_id = screen.get('screen_id')
+                showtime_id = showtime.get('showtime_id')
+                if not cinema_id or not screen_id or not showtime_id:
+                    continue
+                fmt = parse_screen_format(screen.get('name') or '')
+                showtimes.append({
+                    'cinema_id': str(cinema_id),
+                    'showtime_id': int(showtime_id),
+                    'screen_id': int(screen_id),
+                    'starts_at': str(showtime.get('start_time') or 'TBD'),
+                    'format_label': fmt.replace('_', ' ').title(),
+                })
+
+            if not showtimes:
+                return self._mock.get_movie_showtimes(movie_name)
+            return showtimes
+        except Exception as e:
+            logger.error(f"Showtimes query failed, using fallback: {e}")
+            return self._mock.get_movie_showtimes(movie_name)
 
 
 # =====================================================================
@@ -385,14 +501,15 @@ ml_system = AuraMLEngine(data_provider=provider)
 
 # Initialize and mount SeatSelectionRBA router if Supabase is available
 try:
-    if USE_SUPABASE and hasattr(provider, 'supabase'):
+    if USE_SUPABASE and isinstance(provider, SupabaseDataProvider):
         madhev.rba_engine = madhev.SeatSelectionRBA(provider.supabase)
-        app.include_router(madhev.seat_router, prefix="/rba")
     else:
-        # If not using Supabase we still mount the router but leave engine uninitialized
-        app.include_router(madhev.seat_router, prefix="/rba")
+        madhev.rba_engine = madhev.MockSeatSelectionRBA()
+    app.include_router(madhev.seat_router, prefix="/rba")
+    owner.init_owner_router(provider)
+    app.include_router(owner.owner_router, prefix="/owner")
 except Exception as _e:
-    logger.warning(f"Could not initialize Seat RBA router: {_e}")
+    logger.warning(f"Could not initialize routers: {_e}")
 
 # --- REQUEST / RESPONSE JSON MODELS ---
 class MovieProfileModel(BaseModel):
@@ -424,6 +541,19 @@ class TheaterRankingResponseModel(BaseModel):
     reason: str
     lift: float
     score: float
+    showtimes: List[Dict[str, Any]] = []
+
+class MovieAnalyzeRequestModel(BaseModel):
+    title: str
+
+class MovieAnalyzeResponseModel(BaseModel):
+    status: str
+    movie: str
+    ratio: str
+    recommended_format: str
+    snippet_preview: str
+    source: str
+    movie_profile: MovieProfileModel
 
 class APIResponseModel(BaseModel):
     status: str
@@ -432,10 +562,42 @@ class APIResponseModel(BaseModel):
     optimized_format_target: str
     rankings: List[TheaterRankingResponseModel]
 
+class NowShowingMovieModel(BaseModel):
+    title: str
+    guessed_format: str
+    runtime_min: int
+
+class NowShowingResponseModel(BaseModel):
+    status: str
+    movies: List[NowShowingMovieModel]
+
 # --- API ROUTES ---
 @app.get("/")
 def health_check():
     return {"status": "online", "service": "Aura ML API"}
+
+@app.get("/movies/now-showing", response_model=NowShowingResponseModel)
+def now_showing_movies():
+    return {
+        "status": "success",
+        "movies": provider.get_now_showing_movies()
+    }
+
+@app.post("/movies/analyze", response_model=MovieAnalyzeResponseModel)
+def analyze_movie(req: MovieAnalyzeRequestModel):
+    if not req.title.strip():
+        raise HTTPException(status_code=400, detail="title cannot be empty.")
+    scraped = scraper.analyze_format_from_live_data(req.title.strip())
+    requested_format, profile = scraper.map_scraper_output_to_ml_inputs(scraped)
+    return {
+        "status": "success",
+        "movie": req.title.strip(),
+        "ratio": scraped.get("ratio", ""),
+        "recommended_format": requested_format,
+        "snippet_preview": scraped.get("snippet_preview", ""),
+        "source": scraped.get("source", ""),
+        "movie_profile": profile,
+    }
 
 @app.post("/recommend", response_model=APIResponseModel)
 def get_recommendations(req: RankingRequestModel):
@@ -448,18 +610,32 @@ def get_recommendations(req: RankingRequestModel):
     results = ml_system.rank_theaters_for_user(
         requested_format=requested_format,
         needs_accessibility=req.needs_accessibility,
-        movie_profile=req.movie_profile.dict(),
+        movie_profile=req.movie_profile.model_dump(),
         movie_name=req.movie_name,
         user_lat=req.user_lat,
         user_lon=req.user_lon
     )
+
+    all_showtimes = provider.get_movie_showtimes(req.movie_name)
+    showtimes_by_cinema: Dict[str, List[Dict[str, Any]]] = {}
+    for slot in all_showtimes:
+        showtimes_by_cinema.setdefault(slot["cinema_id"], []).append({
+            "showtime_id": slot["showtime_id"],
+            "screen_id": slot["screen_id"],
+            "starts_at": slot["starts_at"],
+            "format_label": slot["format_label"],
+        })
+
+    enriched = []
+    for theater in results:
+        enriched.append({**theater, "showtimes": showtimes_by_cinema.get(theater["id"], showtimes_by_cinema.get(str(theater["id"]), []))})
 
     return {
         "status": "success",
         "movie": req.movie_name,
         "is_cold_start": clean_guess == "",
         "optimized_format_target": requested_format,
-        "rankings": results
+        "rankings": enriched
     }
 
 if __name__ == "__main__":
